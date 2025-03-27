@@ -1,5 +1,8 @@
 import os
 from pathlib import Path
+import requests
+import time
+import sys
 from haystack import Pipeline
 from haystack.components.converters import PyPDFToDocument
 from haystack.components.preprocessors import DocumentSplitter
@@ -12,6 +15,40 @@ from haystack.components.builders import PromptBuilder
 from haystack_integrations.components.generators.ollama import OllamaGenerator # Use OllamaChatGenerator se preferir formato chat
 
 # --- Configuração Inicial ---
+# Configurações e constantes
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_TIMEOUT = 180  # Timeout em segundos
+MODEL_NAME = "mistral"  # Ou 'llama3', 'phi3', etc.
+
+# Verificação do servidor Ollama
+def check_ollama_server():
+    try:
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            models_list = [m.get("name") for m in models]
+            
+            if not models_list:
+                print(f"⚠️ Nenhum modelo encontrado no servidor Ollama.")
+                return False
+                
+            if MODEL_NAME not in [m.split(':')[0] for m in models_list]:
+                print(f"⚠️ Modelo '{MODEL_NAME}' não encontrado. Modelos disponíveis: {models_list}")
+                print(f"Execute 'ollama pull {MODEL_NAME}' para baixá-lo")
+                return False
+                
+            print(f"✅ Servidor Ollama encontrado com modelo '{MODEL_NAME}' disponível")
+            return True
+    except requests.exceptions.ConnectionError:
+        print(f"❌ Servidor Ollama não encontrado em {OLLAMA_BASE_URL}")
+        print("   Certifique-se que o servidor está rodando com 'ollama serve'")
+    except requests.exceptions.Timeout:
+        print(f"❌ Timeout ao conectar com servidor Ollama")
+    except Exception as e:
+        print(f"❌ Erro ao verificar servidor Ollama: {e}")
+    return False
+
+# --- Carregamento de PDFs ---
 pdf_dir = Path(".")
 pdf_files = list(pdf_dir.glob("*.pdf"))
 
@@ -47,6 +84,12 @@ print("Iniciando indexação dos PDFs...")
 indexing_pipeline.run({"converter": {"sources": [str(p) for p in pdf_files]}})
 print(f"Indexação concluída. {document_store.count_documents()} chunks armazenados.")
 
+# Verificar conexão com Ollama antes de prosseguir
+if not check_ollama_server():
+    print("\nVerifique se o servidor Ollama está rodando.")
+    print("Execute 'ollama serve' e 'ollama pull mistral' antes de continuar.")
+    exit(1)
+
 # --- 3. Pipeline de Query (RAG com Ollama) ---
 print("Configurando pipeline de RAG (Query) com Ollama...")
 text_embedder = SentenceTransformersTextEmbedder(model="sentence-transformers/all-MiniLM-L6-v2")
@@ -67,17 +110,14 @@ Resposta:
 """
 prompt_builder = PromptBuilder(template=prompt_template)
 
-# Gerador de Resposta (LLM) - Usando Ollama
-# Certifique-se que o modelo ('mistral', 'llama3', 'phi3') foi baixado com 'ollama pull'
-# e que o servidor Ollama está rodando.
+# Gerador de Resposta (LLM) - Usando Ollama com timeout aumentado
 llm = OllamaGenerator(
-    model="mistral", # Ou 'llama3', 'phi3', etc.
-    url="http://localhost:11434/api/generate", # URL padrão do Ollama
-    generation_kwargs={ # Opcional: ajuste parâmetros de geração
-        "num_predict": 150, # Máximo de tokens na resposta
-        "temperature": 0.3, # Mais baixo = mais determinístico
-        # "top_p": 0.9,
-        # "stop": ["\n", "Pergunta:"] # Palavras/tokens para parar a geração
+    model=MODEL_NAME,
+    url=OLLAMA_BASE_URL,
+    timeout=OLLAMA_TIMEOUT,
+    generation_kwargs={
+        "num_predict": 150,
+        "temperature": 0.3,
     }
 )
 
@@ -102,27 +142,76 @@ while True:
         if not query:
             continue
 
-        print("\nProcessando pergunta com Ollama...")
-        # Executar o pipeline RAG
-        results = rag_pipeline.run(
+        print("\n🔎 Buscando documentos relevantes...")
+        start_time = time.time()
+        
+        # Interface para mostrar o contador de timeout enquanto processa
+        def show_processing_animation():
+            elapsed_time = time.time() - start_time
+            remaining = max(0, OLLAMA_TIMEOUT - elapsed_time)
+            sys.stdout.write(f"\r⏳ Gerando resposta... {elapsed_time:.1f}s decorridos (timeout: {OLLAMA_TIMEOUT}s, restante: {remaining:.1f}s)")
+            sys.stdout.flush()
+        
+        # Executar o pipeline RAG com feedback visual
+        animation_timer = None
+        
+        # Buscar documentos primeiro (mais rápido)
+        retrieval_results = rag_pipeline.run(
             {
                 "text_embedder": {"text": query},
-                "prompt_builder": {"query": query}
-            }
+            },
+            run_only=["text_embedder", "retriever"]
         )
+        
+        print(f"✅ {len(retrieval_results['retriever']['documents'])} documentos encontrados.")
+        print("\n🧠 Gerando resposta com o modelo...")
+        
+        # Iniciar animação de processamento
+        try:
+            while True:
+                show_processing_animation()
+                time.sleep(0.5)
+                if time.time() - start_time >= OLLAMA_TIMEOUT:
+                    break
+                
+        except KeyboardInterrupt:
+            print("\n❌ Operação cancelada pelo usuário.")
+            continue
+            
+        # Executar o LLM com os documentos recuperados
+        results = rag_pipeline.run(
+            {
+                "prompt_builder": {
+                    "query": query, 
+                    "documents": retrieval_results['retriever']['documents']
+                }
+            },
+            run_only=["prompt_builder", "llm"]
+        )
+        
+        processing_time = time.time() - start_time
+        print(f"\n✅ Resposta gerada em {processing_time:.2f}s")
 
         # Imprimir a resposta gerada pelo LLM Ollama
-        # A resposta está dentro da chave 'replies' no resultado do OllamaGenerator
-        if results["llm"]["replies"]:
+        if "llm" in results and "replies" in results["llm"] and results["llm"]["replies"]:
             resposta_gerada = results["llm"]["replies"][0]
-            print("\nResposta:")
-            print(resposta_gerada.strip()) # .strip() para remover espaços extras
+            print("\n📝 Resposta:")
+            print("-" * 80)
+            print(resposta_gerada.strip())
+            print("-" * 80)
         else:
-            print("\nO modelo não gerou uma resposta.")
+            print("\n❌ O modelo não gerou uma resposta.")
+            print(f"[DEBUG] Conteúdo do resultado: {results}")
 
+    except requests.exceptions.Timeout:
+        print(f"\n⏱️ Timeout na requisição ao Ollama após {OLLAMA_TIMEOUT}s.")
+        print("Tente aumentar o valor de OLLAMA_TIMEOUT ou verificar o servidor.")
+    except requests.exceptions.ConnectionError:
+        print(f"\n❌ Erro de conexão com o servidor Ollama em {OLLAMA_BASE_URL}")
+        print("Verifique se o servidor está rodando com 'ollama serve'")
     except Exception as e:
-        print(f"Ocorreu um erro: {e}")
+        print(f"\n❌ Ocorreu um erro: {e}")
         import traceback
-        traceback.print_exc() # Imprime mais detalhes do erro
+        traceback.print_exc()
 
 print("\nEncerrando.")

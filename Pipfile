@@ -6,10 +6,11 @@ name = "pypi"
 [packages]
 datasets = ">=2.6.1"
 sentence-transformers = ">=3.0.0"
-haystack = "*"
 pypdf = "*"
 haystack-ai = "*"
 pydantic = ">=2.0.0"
+haystack = "*"
+ollama-haystack = "*"
 
 [dev-packages]
 
