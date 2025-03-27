@@ -3,6 +3,9 @@ from pathlib import Path
 import requests
 import time
 import sys
+import threading
+
+
 from haystack import Pipeline
 from haystack.components.converters import PyPDFToDocument
 from haystack.components.preprocessors import DocumentSplitter
@@ -121,17 +124,16 @@ llm = OllamaGenerator(
     }
 )
 
-# Construir o pipeline de RAG/Query
-rag_pipeline = Pipeline()
-rag_pipeline.add_component("text_embedder", text_embedder)
-rag_pipeline.add_component("retriever", retriever)
-rag_pipeline.add_component("prompt_builder", prompt_builder)
-rag_pipeline.add_component("llm", llm)
+# Separar em dois pipelines: um de recuperação e um de geração
+retrieval_pipeline = Pipeline()
+retrieval_pipeline.add_component("text_embedder", text_embedder)
+retrieval_pipeline.add_component("retriever", retriever)
+retrieval_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
 
-# Conectar os componentes
-rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
-rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
-rag_pipeline.connect("prompt_builder.prompt", "llm.prompt")
+generation_pipeline = Pipeline()
+generation_pipeline.add_component("prompt_builder", prompt_builder)
+generation_pipeline.add_component("llm", llm)
+generation_pipeline.connect("prompt_builder.prompt", "llm.prompt")
 
 # --- 4. Fazer uma Pergunta ---
 while True:
@@ -145,22 +147,17 @@ while True:
         print("\n🔎 Buscando documentos relevantes...")
         start_time = time.time()
         
-        # Interface para mostrar o contador de timeout enquanto processa
         def show_processing_animation():
             elapsed_time = time.time() - start_time
             remaining = max(0, OLLAMA_TIMEOUT - elapsed_time)
             sys.stdout.write(f"\r⏳ Gerando resposta... {elapsed_time:.1f}s decorridos (timeout: {OLLAMA_TIMEOUT}s, restante: {remaining:.1f}s)")
             sys.stdout.flush()
         
-        # Executar o pipeline RAG com feedback visual
-        animation_timer = None
-        
         # Buscar documentos primeiro (mais rápido)
-        retrieval_results = rag_pipeline.run(
+        retrieval_results = retrieval_pipeline.run(
             {
                 "text_embedder": {"text": query},
-            },
-            run_only=["text_embedder", "retriever"]
+            }
         )
         
         print(f"✅ {len(retrieval_results['retriever']['documents'])} documentos encontrados.")
@@ -168,27 +165,53 @@ while True:
         
         # Iniciar animação de processamento
         try:
-            while True:
-                show_processing_animation()
-                time.sleep(0.5)
-                if time.time() - start_time >= OLLAMA_TIMEOUT:
-                    break
-                
+            animation_thread = None
+            stop_animation = threading.Event()
+            
+            # Função contínua para a animação
+            def animation_loop():
+                while not stop_animation.is_set():
+                    show_processing_animation()
+                    time.sleep(0.5)
+                # Limpar a linha quando a animação parar
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                sys.stdout.flush()
+            
+            # Iniciar animação em uma thread separada
+            
+            animation_thread = threading.Thread(target=animation_loop)
+            animation_thread.daemon = True  # A thread será encerrada quando o programa principal terminar
+            animation_thread.start()
+            
+            # Executar o LLM com os documentos recuperados
+            results = generation_pipeline.run(
+                {
+                    "prompt_builder": {
+                        "query": query, 
+                        "documents": retrieval_results['retriever']['documents']
+                    }
+                }
+            )
+            
+            # Parar a animação
+            stop_animation.set()
+            if animation_thread and animation_thread.is_alive():
+                animation_thread.join(timeout=1.0)  # Aguardar a thread finalizar
+            
         except KeyboardInterrupt:
+            # Garantir que a animação pare se o usuário interromper
+            if 'stop_animation' in locals() and animation_thread and animation_thread.is_alive():
+                stop_animation.set()
+                animation_thread.join(timeout=1.0)
             print("\n❌ Operação cancelada pelo usuário.")
             continue
-            
-        # Executar o LLM com os documentos recuperados
-        results = rag_pipeline.run(
-            {
-                "prompt_builder": {
-                    "query": query, 
-                    "documents": retrieval_results['retriever']['documents']
-                }
-            },
-            run_only=["prompt_builder", "llm"]
-        )
-        
+        except Exception as e:
+            # Garantir que a animação pare se houver um erro
+            if 'stop_animation' in locals() and animation_thread and animation_thread.is_alive():
+                stop_animation.set()
+                animation_thread.join(timeout=1.0)
+            raise  # Re-lança a exceção para ser tratada pelo bloco except externo
+
         processing_time = time.time() - start_time
         print(f"\n✅ Resposta gerada em {processing_time:.2f}s")
 
